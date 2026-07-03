@@ -1,0 +1,188 @@
+"""Modelagem de volatilidade condicional com GARCH.
+
+Modelo padrão: GARCH(1,1) com média constante,
+
+    r_t = mu + eps_t,   eps_t = sigma_t * z_t,   z_t ~ N(0, 1)
+    sigma_t^2 = omega + alpha * eps_{t-1}^2 + beta * sigma_{t-1}^2
+
+Interpretação dos parâmetros:
+
+* ``omega``  — piso de variância de longo prazo (escala);
+* ``alpha``  — reação a choques recentes (efeito ARCH);
+* ``beta``   — persistência da variância passada;
+* ``alpha + beta`` — persistência total; < 1 garante estacionariedade em
+  covariância e existência da variância incondicional
+  ``omega / (1 - alpha - beta)``.
+
+Detalhe numérico importante: a biblioteca ``arch`` recomenda escalar os
+retornos (x100, i.e., em %) para estabilizar o otimizador de máxima
+verossimilhança. Fazemos isso internamente e **desfazemos a escala na
+saída**, para que o chamador nunca precise pensar nisso.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+from .config import TRADING_DAYS_PER_YEAR
+from .exceptions import ModelFitError
+from .logging_setup import get_logger
+from .validation import as_clean_series, require_min_length
+
+log = get_logger(__name__)
+
+#: Fator de escala recomendado pela ``arch`` para retornos diários.
+_SCALE: float = 100.0
+
+#: GARCH precisa de amostra razoável; abaixo disso a MLE fica instável.
+MIN_OBS_GARCH: int = 250
+
+
+@dataclass(frozen=True)
+class GarchResult:
+    """Resultado imutável do ajuste GARCH de um ativo.
+
+    Attributes
+    ----------
+    omega, alpha, beta:
+        Parâmetros estimados **na escala original dos retornos**
+        (a des-escala de ``omega`` é ``/ 100²``; ``alpha`` e ``beta``
+        são adimensionais e não mudam).
+    persistence:
+        ``alpha + beta``.
+    long_run_vol_annual:
+        Volatilidade incondicional anualizada
+        ``sqrt(252 * omega / (1 - persistência))``; ``nan`` se
+        persistência >= 1 (variância incondicional inexistente).
+    forecast_vol_daily:
+        Previsão de volatilidade **1 passo à frente** (diária, fração).
+    forecast_vol_annual:
+        A mesma previsão anualizada por ``sqrt(252)``.
+    converged:
+        ``True`` se o otimizador reportou convergência.
+    """
+
+    omega: float
+    alpha: float
+    beta: float
+    persistence: float
+    long_run_vol_annual: float
+    forecast_vol_daily: float
+    forecast_vol_annual: float
+    converged: bool
+
+
+def fit_garch(returns: pd.Series | np.ndarray, p: int = 1, q: int = 1) -> GarchResult:
+    """Ajusta um GARCH(p, q) e produz a previsão de vol 1 passo à frente.
+
+    Parameters
+    ----------
+    returns:
+        Retornos diários em fração (ex.: 0.012 = 1,2%). NaN descartados.
+    p:
+        Ordem ARCH (defasagens de ``eps²``); padrão 1.
+    q:
+        Ordem GARCH (defasagens de ``sigma²``); padrão 1.
+
+    Returns
+    -------
+    GarchResult
+        Parâmetros na escala original + previsões diária/anualizada.
+
+    Raises
+    ------
+    DataValidationError
+        Série curta demais (mínimo :data:`MIN_OBS_GARCH`).
+    ModelFitError
+        Se a estimação por máxima verossimilhança falhar/levantar erro.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> rng = np.random.default_rng(0)
+    >>> res = fit_garch(rng.normal(0, 0.01, size=1000))
+    >>> 0 < res.forecast_vol_daily < 0.05
+    True
+    """
+    from arch import arch_model  # import tardio: dependência pesada
+
+    series = as_clean_series(returns, "retornos (GARCH)")
+    require_min_length(series, MIN_OBS_GARCH, "retornos (GARCH)")
+
+    scaled = series * _SCALE
+    try:
+        model = arch_model(scaled, mean="Constant", vol="GARCH", p=p, q=q, dist="normal")
+        # disp="off": estimação silenciosa; logging fica por nossa conta.
+        fitted = model.fit(disp="off", show_warning=False)
+    except Exception as exc:  # a arch levanta LinAlgError/ValueError variados
+        raise ModelFitError(f"Falha ao estimar GARCH({p},{q}): {exc}") from exc
+
+    params = fitted.params
+    # des-escala: Var(c*X) = c² Var(X) => omega_% / 100² volta à fração.
+    omega = float(params.get("omega", np.nan)) / (_SCALE**2)
+    alpha = float(sum(params.get(f"alpha[{i}]", 0.0) for i in range(1, p + 1)))
+    beta = float(sum(params.get(f"beta[{i}]", 0.0) for i in range(1, q + 1)))
+    persistence = alpha + beta
+
+    if persistence < 1.0:
+        long_run_var_daily = omega / (1.0 - persistence)
+        long_run_vol_annual = float(np.sqrt(TRADING_DAYS_PER_YEAR * long_run_var_daily))
+    else:
+        # IGARCH na prática: variância incondicional não existe.
+        long_run_vol_annual = float("nan")
+        log.warning("Persistência GARCH >= 1 (%.4f): variância de longo prazo indefinida.", persistence)
+
+    # forecast(horizon=1): variância prevista para t+1, na escala %².
+    variance_next = float(fitted.forecast(horizon=1, reindex=False).variance.iloc[0, 0])
+    vol_daily = float(np.sqrt(variance_next)) / _SCALE
+    vol_annual = vol_daily * float(np.sqrt(TRADING_DAYS_PER_YEAR))
+
+    converged = bool(getattr(fitted, "convergence_flag", 0) == 0)
+    if not converged:
+        log.warning("Otimizador GARCH não reportou convergência (flag != 0).")
+
+    log.info(
+        "GARCH(%d,%d): alpha=%.4f beta=%.4f persist=%.4f vol_1d=%.4f%%",
+        p, q, alpha, beta, persistence, vol_daily * 100,
+    )
+    return GarchResult(
+        omega=omega,
+        alpha=alpha,
+        beta=beta,
+        persistence=persistence,
+        long_run_vol_annual=long_run_vol_annual,
+        forecast_vol_daily=vol_daily,
+        forecast_vol_annual=vol_annual,
+        converged=converged,
+    )
+
+
+def garch_report(returns: pd.DataFrame) -> pd.DataFrame:
+    """Ajusta GARCH(1,1) coluna a coluna e consolida em tabela.
+
+    Ativos cujo ajuste falhar são registrados com ``NaN`` e o motivo é
+    logado — o pipeline não deve morrer porque *um* papel ilíquido não
+    convergiu (isolamento de falhas, ETAPA 3).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Índice = ticker; colunas = campos de :class:`GarchResult`.
+    """
+    rows: dict[str, dict[str, float | bool]] = {}
+    for column in returns.columns:
+        try:
+            result = fit_garch(returns[column])
+            rows[str(column)] = result.__dict__.copy()
+        except Exception as exc:  # noqa: BLE001 — isolar falha por ativo é intencional
+            log.error("GARCH falhou para %s: %s", column, exc)
+            rows[str(column)] = {
+                "omega": np.nan, "alpha": np.nan, "beta": np.nan,
+                "persistence": np.nan, "long_run_vol_annual": np.nan,
+                "forecast_vol_daily": np.nan, "forecast_vol_annual": np.nan,
+                "converged": False,
+            }
+    return pd.DataFrame.from_dict(rows, orient="index").sort_index()

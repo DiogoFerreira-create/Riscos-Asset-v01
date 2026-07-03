@@ -1,0 +1,59 @@
+"""Testes de risk_models.factors: correlação e PCA em casos com resposta conhecida."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from risk_models import correlation_matrix, pca_factors
+from risk_models.exceptions import DataValidationError
+
+
+class TestCorrelation:
+    def test_identical_series_corr_one(self, rng: np.random.Generator) -> None:
+        base = rng.normal(0, 0.01, 200)
+        df = pd.DataFrame({"A": base, "B": base})
+        corr = correlation_matrix(df)
+        assert corr.loc["A", "B"] == pytest.approx(1.0)
+
+    def test_window_uses_tail_only(self, rng: np.random.Generator) -> None:
+        """Séries independentes no início e idênticas nos últimos 50 dias:
+        a correlação da janela 50 deve ser ~1, a da amostra completa não."""
+        n = 300
+        a = rng.normal(0, 0.01, n)
+        b = rng.normal(0, 0.01, n)
+        b[-50:] = a[-50:]
+        df = pd.DataFrame({"A": a, "B": b})
+        assert correlation_matrix(df, window=50).loc["A", "B"] == pytest.approx(1.0)
+        assert correlation_matrix(df).loc["A", "B"] < 0.9
+
+    def test_single_asset_rejected(self) -> None:
+        with pytest.raises(DataValidationError):
+            correlation_matrix(pd.DataFrame({"A": [0.1, 0.2, 0.3]}))
+
+
+class TestPca:
+    def test_common_factor_dominates(self, returns_frame: pd.DataFrame) -> None:
+        """AAA e BBB compartilham fator de mercado: PC1 deve explicar a
+        maior fatia e as variâncias explicadas devem vir ordenadas."""
+        res = pca_factors(returns_frame, n_components=3)
+        evr = res.explained_variance_ratio.to_numpy()
+        assert evr[0] == max(evr)
+        assert np.all(np.diff(evr) <= 1e-12)
+        assert evr.sum() == pytest.approx(1.0)
+
+    def test_two_identical_assets_one_component(self, rng: np.random.Generator) -> None:
+        base = rng.normal(0, 0.01, 300)
+        df = pd.DataFrame({"A": base, "B": base + rng.normal(0, 1e-6, 300)})
+        res = pca_factors(df, n_components=1)
+        assert float(res.explained_variance_ratio.iloc[0]) > 0.999
+
+    def test_too_many_components_rejected(self, returns_frame: pd.DataFrame) -> None:
+        with pytest.raises(DataValidationError, match="n_components"):
+            pca_factors(returns_frame, n_components=10)
+
+    def test_shapes(self, returns_frame: pd.DataFrame) -> None:
+        res = pca_factors(returns_frame, n_components=2)
+        assert res.loadings.shape == (3, 2)
+        assert res.factor_returns.shape == (len(returns_frame), 2)

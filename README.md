@@ -1,123 +1,265 @@
-# Riscos-Asset-v01
+"""Value-at-Risk e Expected Shortfall (CVaR).
 
-# Projeto Riscos-Asset-v01
+Convenção de sinal (importante!)
+--------------------------------
+Todas as funções retornam risco como **número positivo em fração do
+patrimônio**: ``VaR 99% = 0.032`` significa "com 99% de confiança, a
+perda diária não excede 3,2%". Internamente trabalhamos com retornos
+(ganhos positivos, perdas negativas) e invertemos o sinal só na saída.
+Fixar a convenção em um único lugar elimina a fonte nº 1 de bugs em
+código de risco: sinais trocados entre camadas.
 
-## Descrição Curta
-O `Riscos-Asset-v01` é uma plataforma em Python para modelagem e monitoramento de riscos de mercado e liquidez em portfólios de ativos. O sistema automatiza o cálculo de métricas essenciais, orquestrado por um pipeline de dados diário, com foco em configuração flexível, testes e documentação para apoiar o controle de riscos e a tomada de decisão.
+Metodologias implementadas
+--------------------------
+* **Histórica** — quantil empírico da distribuição de retornos; não
+  assume forma distribucional, mas "só conhece" o que está na janela.
+* **Paramétrica (Delta-Normal)** — assume retornos ~ Normal(mu, sigma²):
+  ``VaR_alpha = -(mu + z_{1-alpha} * sigma)``. Rápida e suave, porém
+  subestima caudas pesadas (curtose) típicas de retornos financeiros.
+* **CVaR / Expected Shortfall** — média das perdas *além* do VaR;
+  responde "quando o VaR estoura, quão ruim fica, em média?" e é
+  subaditiva (medida coerente de risco, Artzner et al., 1999).
+"""
 
-## Visão Geral
-Este projeto implementa um conjunto de modelos quantitativos para análise de risco financeiro. Ele permite a extração de dados de mercado, o cálculo de diversas métricas de risco, a modelagem de volatilidade, a análise de liquidez e fatores, além do backtesting dos modelos de VaR. A orquestração das tarefas é projetada para ser gerenciada pelo Apache Airflow, garantindo execuções diárias e consistentes.
+from __future__ import annotations
 
-## Principais Funcionalidades e Módulos Implementados (`risk_models`)
-* **Retornos (`returns`):**
-    * Download de preços históricos de ativos (via `yfinance`).
-    * Cálculo de retornos logarítmicos.
-    * Tratamento de outliers (Winsorização).
-* **Value-at-Risk (`var`):**
-    * VaR Histórico.
-    * VaR Paramétrico (Delta-Normal).
-    * Conditional VaR (CVaR) / Expected Shortfall.
-* **Volatilidade (`garch`):**
-    * Ajuste de modelos GARCH (padrão GARCH(1,1)).
-    * Previsão de volatilidade um passo à frente.
-* **Liquidez (`liquidity`):**
-    * Cálculo de Volume Médio Diário Negociado (ADV).
-    * Cálculo de Dias para Liquidar (DTL).
-    * Estimativa de Slippage de Bid-Ask.
-* **Fatores de Risco (`factors`):**
-    * Cálculo de matrizes de correlação (móvel ou amostra completa).
-    * Análise de Componentes Principais (PCA) para extração de fatores.
-* **Backtesting de VaR (`backtest`):**
-    * Teste de Proporção de Falhas de Kupiec (POF / LR_uc).
-    * Teste de Cobertura Condicional de Christoffersen (LR_cc).
+import numpy as np
+import pandas as pd
+from scipy import stats
 
-## Tecnologias Utilizadas
-* **Linguagem:** Python 3.x
-* **Bibliotecas Principais:**
-    * Pandas: Manipulação e análise de dados.
-    * NumPy: Operações numéricas.
-    * SciPy: Funções estatísticas (distribuições, testes Qui-quadrado).
-    * yfinance: Download de dados de mercado.
-    * arch: Modelagem GARCH.
-    * scikit-learn: Análise de Componentes Principais (PCA).
-    * PyArrow: Leitura e escrita de arquivos Parquet.
-    * Pendulum: Manipulação de datas e fusos horários (especialmente para Airflow).
-* **Orquestração de Pipeline:** Apache Airflow (o script da DAG está em `dags/risk_pipeline.py`).
-* **Testes:** Pytest.
-* **Configuração:** Arquivos YAML (`config/paths.yaml`, `config/limits.yaml`).
+from .config import VarMethod
+from .exceptions import DataValidationError
+from .logging_setup import get_logger
+from .validation import as_clean_series, require_alpha, require_min_length
 
-## Estrutura do Projeto (Principais Pastas)
-```
-Riscos-Asset-v01/
-├── config/               # Arquivos de configuração (YAML) para paths e limites
-├── dags/                 # Scripts de DAGs para Apache Airflow
-│   └── risk_pipeline.py  # Pipeline principal de cálculo de riscos
-├── data/                 # Dados gerados pelo pipeline (ex: Parquet)
-│   └── curated_risk_pipeline/
-├── risk_models/          # Pacote Python com os módulos de cálculo de risco
-│   ├── __init__.py       # Torna risk_models um pacote e define a API pública
-│   ├── returns.py
-│   ├── var.py
-│   ├── garch.py
-│   ├── liquidity.py
-│   ├── factors.py
-│   └── backtest.py
-├── tests/                # Testes unitários (PyTest)
-│   ├── test_var.py
-│   ├── test_liquidity.py
-│   └── test_backtest.py
-├── requirements.txt      # Dependências do projeto Python
-├── MODEL_RISK.md         # Documentação técnica dos modelos
-└── README.md             # Este arquivo
-```
+log = get_logger(__name__)
 
-## Configuração e Execução
+#: Amostra mínima para estimar um quantil de cauda com o mínimo de dignidade.
+#: Com menos de ~60 pontos, o quantil de 99% é definido por 1 observação.
+MIN_OBS_VAR: int = 60
 
-### 1. Pré-requisitos
-* Python 3.8+ (ou a versão especificada no seu ambiente)
-* `pip` (gerenciador de pacotes Python)
+#: Piso numérico para considerar um desvio-padrão "zero". Comparar float
+#: com ``== 0.0`` falha para séries constantes cujo valor não é exatamente
+#: representável em binário (ex.: 0.001): os desvios ficam em ~1e-19, não 0.
+#: Retornos diários reais têm sigma >= 1e-4, então 1e-12 separa com folga
+#: "constante a menos de ruído de máquina" de qualquer série genuína.
+_SIGMA_FLOOR: float = 1e-12
 
-### 2. Instalação de Dependências
-Clone o repositório (se aplicável) ou certifique-se de que todos os arquivos do projeto estejam no seu ambiente. Na pasta raiz do projeto (`Riscos-Asset-v01/`), instale as dependências:
-```bash
-pip install -r requirements.txt
-```
 
-### 3. Configuração
-* Os caminhos para dados (`raw`, `curated`, `tables`, etc.) e os limites de risco podem ser configurados através de variáveis de ambiente. Consulte os arquivos `config/paths.yaml` e `config/limits.yaml` para ver os nomes das variáveis e os valores padrão.
-* Por exemplo, para definir o diretório de dados curados, você pode exportar no seu terminal:
-    ```bash
-    export RISK_CURATED_DIR="/caminho/para/seus/dados/curados"
-    ```
-    Se as variáveis de ambiente não estiverem definidas, o pipeline usará padrões definidos no código (geralmente criando uma pasta `data/curated_risk_pipeline/` dentro da raiz do projeto para os arquivos Parquet gerados na execução local de teste).
+def historical_var(returns: pd.Series | np.ndarray, alpha: float = 0.99) -> float:
+    """VaR histórico (não paramétrico) no nível ``alpha``.
 
-### 4. Executando os Testes Unitários
-Para rodar os testes unitários (requer `pytest` instalado):
-```bash
-pytest
-```
-Ou para um arquivo de teste específico (estando na raiz do projeto):
-```bash
-pytest tests/nome_do_arquivo_de_teste.py
-```
+    Definição: o quantil ``1 - alpha`` da distribuição empírica dos
+    retornos, com sinal invertido. Ex.: alpha=0.99 usa o percentil 1.
 
-### 5. Executando o Pipeline
-* **Localmente (para teste das tarefas Python, sem um ambiente Airflow completo):**
-    O script `dags/risk_pipeline.py` contém um bloco `if __name__ == "__main__":` (que é ativado quando o Airflow não é detectado) que permite executar uma sequência de tarefas para fins de teste e depuração local. Execute a partir da pasta raiz do projeto:
-    ```bash
-    python dags/risk_pipeline.py
-    ```
-    (Este comando assume que o ajuste de `sys.path` dentro de `dags/risk_pipeline.py` está funcionando para encontrar o pacote `risk_models`.)
-* **Com Apache Airflow:**
-    1.  Certifique-se de que o Airflow esteja instalado e configurado corretamente.
-    2.  Coloque (ou crie um link simbólico para) o arquivo `dags/risk_pipeline.py` na pasta de DAGs (`dags_folder`) do seu ambiente Airflow.
-    3.  O Airflow irá detectar o DAG automaticamente. Ele poderá então ser habilitado, gerenciado e executado através da interface web do Airflow, seguindo o agendamento definido (`08:00 America/Recife, Segunda a Sexta`).
+    Parameters
+    ----------
+    returns:
+        Série de retornos (fração, não %). NaN são descartados.
+    alpha:
+        Nível de confiança em (0, 1); padrão 0.99.
 
-## Documentação dos Modelos
-Consulte o arquivo [MODEL_RISK.md](MODEL_RISK.md) para uma descrição técnica detalhada das fórmulas, hipóteses e limitações dos modelos implementados no pacote `risk_models`.
+    Returns
+    -------
+    float
+        VaR como perda positiva (fração do patrimônio).
 
-## Próximos Passos / Funcionalidades Futuras
-* **Dashboards Interativos:** Em breve, o projeto contará com dashboards interativos (potencialmente utilizando ferramentas como Streamlit, Dash ou integrando com plataformas de Business Intelligence) para visualização dinâmica das métricas de risco e dos resultados dos modelos.
-* **Testes de Estresse (Stress Testing):** Planejamos expandir as capacidades de análise de risco com a implementação de cenários de testes de estresse mais elaborados e configuráveis, permitindo uma avaliação mais profunda do impacto de eventos de mercado extremos no portfólio.
-* Refinamento contínuo da estratégia de cálculo de VaR e Retorno de Portfólio dentro da tarefa `task_var_backtest`.
-* Integração de uma fonte de dados de volume real para a tarefa `task_liquidity_metrics`, substituindo o placeholder atual.
+    Raises
+    ------
+    DataValidationError
+        Série vazia/curta demais ou ``alpha`` fora de (0, 1).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> r = np.concatenate([np.full(99, 0.001), [-0.05]])
+    >>> round(historical_var(r, alpha=0.99), 4)
+    0.0449
+    """
+    alpha = require_alpha(alpha)
+    series = as_clean_series(returns, "retornos")
+    require_min_length(series, MIN_OBS_VAR, "retornos (VaR histórico)")
+    # interpolation="linear" (padrão) evita depender de 1 único ponto na cauda.
+    quantile = float(series.quantile(1.0 - alpha))
+    return -quantile
+
+
+def parametric_var(returns: pd.Series | np.ndarray, alpha: float = 0.99) -> float:
+    """VaR paramétrico Delta-Normal no nível ``alpha``.
+
+    Fórmula: ``VaR = -(mu + z_{1-alpha} * sigma)``, com ``z`` da Normal
+    padrão. Note que ``z_{1-alpha}`` é negativo (ex.: -2.326 para 99%),
+    logo o VaR resulta positivo quando ``sigma`` domina ``mu`` — o caso
+    típico em horizonte diário.
+
+    Parameters
+    ----------
+    returns:
+        Série de retornos diários.
+    alpha:
+        Nível de confiança em (0, 1).
+
+    Returns
+    -------
+    float
+        VaR como perda positiva (fração do patrimônio).
+
+    Raises
+    ------
+    DataValidationError
+        Série curta/vazia, ``alpha`` inválido ou desvio-padrão nulo
+        (série constante não permite estimar risco).
+    """
+    alpha = require_alpha(alpha)
+    series = as_clean_series(returns, "retornos")
+    require_min_length(series, MIN_OBS_VAR, "retornos (VaR paramétrico)")
+    mu = float(series.mean())
+    sigma = float(series.std(ddof=1))
+    if sigma < _SIGMA_FLOOR:
+        raise DataValidationError("Desvio-padrão zero: série constante não tem VaR definível.")
+    z = float(stats.norm.ppf(1.0 - alpha))
+    return -(mu + z * sigma)
+
+
+def conditional_var(
+    returns: pd.Series | np.ndarray,
+    alpha: float = 0.99,
+    method: VarMethod = VarMethod.HISTORICAL,
+) -> float:
+    """CVaR / Expected Shortfall no nível ``alpha``.
+
+    * ``HISTORICAL``: média dos retornos abaixo do quantil ``1 - alpha``
+      (média empírica da cauda), com sinal invertido.
+    * ``PARAMETRIC``: fórmula fechada sob Normalidade:
+      ``ES = -(mu - sigma * phi(z_{1-alpha}) / (1 - alpha))``,
+      onde ``phi`` é a densidade Normal padrão.
+
+    Parameters
+    ----------
+    returns:
+        Série de retornos diários.
+    alpha:
+        Nível de confiança em (0, 1).
+    method:
+        :class:`~risk_models.config.VarMethod` — casa com a metodologia
+        de VaR usada, para comparabilidade VaR vs. CVaR.
+
+    Returns
+    -------
+    float
+        Expected Shortfall como perda positiva. Sempre ``>= VaR`` do
+        mesmo método/nível (propriedade verificada em teste unitário).
+
+    Raises
+    ------
+    DataValidationError
+        Entradas inválidas (ver validadores) ou cauda empírica vazia.
+    """
+    alpha = require_alpha(alpha)
+    series = as_clean_series(returns, "retornos")
+    require_min_length(series, MIN_OBS_VAR, "retornos (CVaR)")
+
+    if method is VarMethod.PARAMETRIC:
+        mu = float(series.mean())
+        sigma = float(series.std(ddof=1))
+        if sigma < _SIGMA_FLOOR:
+            raise DataValidationError("Desvio-padrão zero: série constante não tem CVaR definível.")
+        z = float(stats.norm.ppf(1.0 - alpha))
+        es = -(mu - sigma * float(stats.norm.pdf(z)) / (1.0 - alpha))
+        return es
+
+    threshold = float(series.quantile(1.0 - alpha))
+    tail = series[series <= threshold]
+    if tail.empty:
+        # Amostra pequena + alpha alto podem esvaziar a cauda estrita;
+        # o quantil em si é o pior caso observável.
+        log.warning("Cauda vazia para alpha=%.3f; CVaR reduzido ao próprio quantil.", alpha)
+        return -threshold
+    return -float(tail.mean())
+
+
+def portfolio_returns(returns: pd.DataFrame, weights: tuple[float, ...] | np.ndarray) -> pd.Series:
+    """Retorno do portfólio: combinação linear ``R @ w`` dos retornos.
+
+    Nota metodológica: a combinação linear é exata para retornos
+    aritméticos; para log-retornos diários é uma aproximação de primeira
+    ordem, excelente em horizonte de 1 dia (erro ~ O(r²)) e padrão de
+    mercado para VaR diário. A limitação está documentada em
+    ``MODEL_RISK.md``.
+
+    Parameters
+    ----------
+    returns:
+        Retornos por ativo (datas x tickers).
+    weights:
+        Pesos na ordem das colunas; devem somar 1 (tolerância 1e-6).
+
+    Returns
+    -------
+    pandas.Series
+        Série de retornos do portfólio (linhas com qualquer NaN são
+        descartadas para não contaminar a soma ponderada).
+
+    Raises
+    ------
+    DataValidationError
+        Dimensões incompatíveis ou pesos que não somam 1.
+    """
+    w = np.asarray(weights, dtype="float64")
+    if returns.shape[1] != w.shape[0]:
+        raise DataValidationError(
+            f"{returns.shape[1]} colunas de retorno para {w.shape[0]} pesos."
+        )
+    if not np.isclose(w.sum(), 1.0, atol=1e-6):
+        raise DataValidationError(f"Pesos somam {w.sum():.6f}; esperado 1.0.")
+    clean = returns.dropna(how="any")
+    if clean.empty:
+        raise DataValidationError("Sem datas completas (todas as linhas contêm NaN).")
+    return pd.Series(clean.to_numpy() @ w, index=clean.index, name="portfolio")
+
+
+def var_report(
+    returns: pd.DataFrame,
+    weights: tuple[float, ...],
+    alphas: tuple[float, ...],
+    portfolio_value: float,
+) -> pd.DataFrame:
+    """Tabela consolidada de VaR/CVaR por ativo e do portfólio.
+
+    Para cada ativo e para o portfólio agregado calcula, em cada nível de
+    ``alphas``: VaR histórico, VaR paramétrico e CVaR histórico — em
+    fração e em moeda (``* portfolio_value``, no caso do portfólio; para
+    ativos individuais, em fração apenas, pois a exposição monetária de
+    cada um depende do peso).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Índice = nome do ativo (ou ``"PORTFOLIO"``); colunas no formato
+        ``var_hist_99``, ``var_param_99``, ``cvar_99`` etc., mais
+        ``var_hist_99_brl`` para o portfólio.
+    """
+    rows: dict[str, dict[str, float]] = {}
+
+    def _metrics(series: pd.Series) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for alpha in alphas:
+            tag = f"{int(round(alpha * 100))}"
+            out[f"var_hist_{tag}"] = historical_var(series, alpha)
+            out[f"var_param_{tag}"] = parametric_var(series, alpha)
+            out[f"cvar_{tag}"] = conditional_var(series, alpha, VarMethod.HISTORICAL)
+        return out
+
+    for column in returns.columns:
+        rows[str(column)] = _metrics(returns[column])
+
+    port = portfolio_returns(returns, weights)
+    port_metrics = _metrics(port)
+    # Métricas monetárias apenas no agregado: é onde o PL de referência se aplica.
+    for key, value in list(port_metrics.items()):
+        port_metrics[f"{key}_brl"] = value * portfolio_value
+    rows["PORTFOLIO"] = port_metrics
+
+    report = pd.DataFrame.from_dict(rows, orient="index").sort_index()
+    log.info("Relatório de VaR gerado para %d ativos + portfólio.", len(returns.columns))
+    return report

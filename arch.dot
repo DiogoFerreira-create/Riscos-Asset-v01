@@ -1,0 +1,66 @@
+"""Testes de risk_models.var contra valores teóricos conhecidos."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+from scipy import stats
+
+from risk_models import (
+    VarMethod, conditional_var, historical_var, parametric_var, portfolio_returns,
+)
+from risk_models.exceptions import DataValidationError
+
+ALPHA = 0.99
+SIGMA = 0.01
+
+
+class TestAgainstNormalTheory:
+    """Com N(0, sigma) e amostra grande, os estimadores devem convergir
+    para os valores fechados da Normal — é o teste mais forte possível."""
+
+    def test_parametric_matches_z_sigma(self, normal_returns: pd.Series) -> None:
+        expected = -stats.norm.ppf(1 - ALPHA) * SIGMA  # ~2.326 * 1%
+        assert parametric_var(normal_returns, ALPHA) == pytest.approx(expected, rel=0.05)
+
+    def test_historical_close_to_parametric(self, normal_returns: pd.Series) -> None:
+        hist = historical_var(normal_returns, ALPHA)
+        par = parametric_var(normal_returns, ALPHA)
+        assert hist == pytest.approx(par, rel=0.10)
+
+    def test_cvar_parametric_closed_form(self, normal_returns: pd.Series) -> None:
+        z = stats.norm.ppf(1 - ALPHA)
+        expected = SIGMA * stats.norm.pdf(z) / (1 - ALPHA)  # ES da Normal (mu~0)
+        got = conditional_var(normal_returns, ALPHA, VarMethod.PARAMETRIC)
+        assert got == pytest.approx(expected, rel=0.05)
+
+    def test_cvar_geq_var(self, normal_returns: pd.Series) -> None:
+        """Propriedade estrutural: ES nunca é menor que o VaR."""
+        assert conditional_var(normal_returns, ALPHA) >= historical_var(normal_returns, ALPHA)
+
+
+class TestValidation:
+    def test_alpha_out_of_range(self, normal_returns: pd.Series) -> None:
+        with pytest.raises(DataValidationError):
+            historical_var(normal_returns, alpha=1.5)
+
+    def test_short_series_rejected(self) -> None:
+        with pytest.raises(DataValidationError, match="mínimo"):
+            historical_var(np.zeros(10) + 0.001, ALPHA)
+
+    def test_constant_series_has_no_parametric_var(self) -> None:
+        with pytest.raises(DataValidationError, match="constante"):
+            parametric_var(np.full(100, 0.001), ALPHA)
+
+
+class TestPortfolio:
+    def test_weighted_combination_exact(self, returns_frame: pd.DataFrame) -> None:
+        w = (0.5, 0.3, 0.2)
+        port = portfolio_returns(returns_frame, w)
+        manual = returns_frame @ np.array(w)
+        np.testing.assert_allclose(port.to_numpy(), manual.to_numpy())
+
+    def test_weights_must_sum_to_one(self, returns_frame: pd.DataFrame) -> None:
+        with pytest.raises(DataValidationError, match="somam"):
+            portfolio_returns(returns_frame, (0.5, 0.5, 0.5))

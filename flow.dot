@@ -1,0 +1,67 @@
+"""Testes de risk_models.liquidity com valores exatos calculáveis à mão."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from risk_models import average_daily_volume, bid_ask_slippage, days_to_liquidate
+from risk_models.liquidity import AdvMethod
+from risk_models.exceptions import DataValidationError
+
+
+class TestAdv:
+    def test_constant_volume(self) -> None:
+        vols = pd.DataFrame({"X": [1e6] * 30})
+        assert float(average_daily_volume(vols, 21)["X"]) == pytest.approx(1e6)
+
+    def test_median_robust_to_spike(self) -> None:
+        """Um dia de leilão 100x maior não deve mover a mediana."""
+        base = [1e6] * 20 + [1e8]
+        vols = pd.DataFrame({"X": base})
+        med = float(average_daily_volume(vols, 21, AdvMethod.MEDIAN)["X"])
+        mean = float(average_daily_volume(vols, 21, AdvMethod.MEAN)["X"])
+        assert med == pytest.approx(1e6)
+        assert mean > 5 * med  # a média dispara; a mediana, não
+
+    def test_window_larger_than_history(self) -> None:
+        with pytest.raises(DataValidationError, match="menor que a janela"):
+            average_daily_volume(pd.DataFrame({"X": [1.0] * 5}), window=21)
+
+
+class TestDtl:
+    def test_hand_computed_value(self) -> None:
+        """Posição 1mi, ADV 1mi, participação 20% => 1/(0.2*1) = 5 dias."""
+        dtl = days_to_liquidate({"X": 1_000_000.0},
+                                pd.Series({"X": 1_000_000.0}), 0.20)
+        assert float(dtl["X"]) == 5.0
+
+    def test_ceiling_applied(self) -> None:
+        """4.2 dias teóricos devem virar 5 (não existe meio dia de venda)."""
+        dtl = days_to_liquidate({"X": 840_000.0},
+                                pd.Series({"X": 1_000_000.0}), 0.20)
+        assert float(dtl["X"]) == 5.0
+
+    def test_zero_adv_is_infinite(self) -> None:
+        dtl = days_to_liquidate({"X": 1.0}, pd.Series({"X": 0.0}), 0.20)
+        assert np.isinf(float(dtl["X"]))
+
+    def test_zero_position_is_zero_days(self) -> None:
+        dtl = days_to_liquidate({"X": 0.0}, pd.Series({"X": 1e6}), 0.20)
+        assert float(dtl["X"]) == 0.0
+
+    def test_invalid_participation(self) -> None:
+        with pytest.raises(DataValidationError):
+            days_to_liquidate({"X": 1.0}, pd.Series({"X": 1.0}), 1.5)
+
+
+class TestSlippage:
+    def test_hand_computed_value(self) -> None:
+        """1mi a 10 bps de spread => meio-spread 5 bps => R$ 500."""
+        cost = bid_ask_slippage({"X": 1_000_000.0}, spread_bps=10.0)
+        assert float(cost["X"]) == pytest.approx(500.0)
+
+    def test_negative_spread_rejected(self) -> None:
+        with pytest.raises(DataValidationError):
+            bid_ask_slippage({"X": 1.0}, spread_bps=-1.0)

@@ -1,0 +1,111 @@
+# MODEL_RISK.md — Hipóteses, Fórmulas e Limitações dos Modelos
+
+Documento de *model risk*: o que cada modelo assume, como calcula e onde ele **falha**. Leitura obrigatória antes de usar os números em decisão real. Notação: retornos logarítmicos diários `r_t = ln(P_t / P_{t-1})`; nível de confiança `alpha` (ex.: 0,99); perdas reportadas como números positivos.
+
+---
+
+## 1. Retornos e tratamento de dados (`returns.py`)
+
+**Fórmula.** `r_t = ln(P_t) - ln(P_{t-1})` sobre preços ajustados (proventos incorporados).
+
+**Por que log-retorno.** Aditividade temporal: o retorno de k dias é a soma dos k retornos diários — conveniente para agregação e para o GARCH. Para |r| pequeno, log-retorno ≈ retorno aritmético (erro de 2ª ordem).
+
+**Winsorização.** Cada coluna é truncada nos percentis configurados (padrão 1%/99%): valores além do percentil são substituídos pelo valor do percentil. Uso no pipeline: **apenas** para estimação de correlação/PCA/GARCH (estabilidade numérica); as métricas de cauda (VaR/CVaR) usam retornos **brutos** — winsorizar antes de medir cauda seria amputar exatamente o que se quer medir.
+
+**Fonte sintética (GBM).** `S_t = S_{t-1} * exp[(mu - sigma^2/2) dt + sigma sqrt(dt) Z_t]`, com `dt = 1/252` e semente fixa. **Limitações:** sem caudas pesadas, sem clusters de volatilidade, sem correlação entre ativos além do acaso — serve para desenvolvimento offline e testes, nunca para risco real (o log grita `WARNING` quando ativa).
+
+---
+
+## 2. Value-at-Risk (`var.py`)
+
+**Definição.** VaR_alpha é o menor valor tal que `P(perda <= VaR) >= alpha` no horizonte de 1 dia.
+
+**Histórico.** `VaR = -Q_{1-alpha}(r)`, quantil empírico (interpolação linear). *Hipótese:* o passado recente representa a distribuição de amanhã. *Limitações:* cego a riscos fora da janela; reage com atraso a mudanças de regime; quantil de cauda com poucas observações é ruidoso (mínimo de 60 obs. imposto no código).
+
+**Paramétrico (Delta-Normal).** `VaR = -(mu + z_{1-alpha} * sigma)`, com `z` da Normal padrão (z_{0,01} ≈ −2,326). *Hipóteses:* retornos i.i.d. Normais; portfólio linear nos fatores. *Limitações:* subestima caudas (curtose dos retornos reais), ignora assimetria; inadequado para opções/não-linearidades.
+
+**CVaR / Expected Shortfall.** Empírico: `ES = -E[r | r <= Q_{1-alpha}]`. Paramétrico-Normal: `ES = -(mu - sigma * phi(z_{1-alpha}) / (1-alpha))`, `phi` = densidade Normal. Propriedades: `ES >= VaR` sempre; medida coerente (subaditiva — Artzner et al., 1999), padrão FRTB/Basileia (ES 97,5%).
+
+**Agregação de portfólio.** `r_p = R w` (combinação linear dos log-retornos). Aproximação de 1ª ordem exata apenas para retornos aritméticos; erro O(r²), desprezível em horizonte diário — documentado para honestidade metodológica.
+
+---
+
+## 3. Volatilidade condicional GARCH (`garch.py`)
+
+**Modelo GARCH(1,1)** (Bollerslev, 1986):
+
+```
+r_t = mu + eps_t,  eps_t = sigma_t z_t,  z_t ~ N(0,1)
+sigma_t^2 = omega + alpha * eps_{t-1}^2 + beta * sigma_{t-1}^2
+```
+
+* `alpha` = reação a choques (ARCH); `beta` = persistência; `alpha + beta` = persistência total.
+* Estacionariedade em covariância exige `alpha + beta < 1`; variância incondicional `omega / (1 - alpha - beta)`.
+* Previsão 1 passo: `sigma_{t+1}^2 = omega + alpha eps_t^2 + beta sigma_t^2`.
+* Anualização: `vol_anual = vol_diaria * sqrt(252)`.
+
+**Detalhe numérico.** Retornos são multiplicados por 100 antes da MLE (recomendação da biblioteca `arch` para condicionamento do otimizador) e os parâmetros são des-escalados na saída (`omega / 100^2`).
+
+**Limitações.** Resposta simétrica a choques (quedas e altas movem a vol igualmente — na prática há efeito alavancagem; extensões: EGARCH/GJR); caudas condicionais Normais (subestima extremos; alternativa: `dist='t'`); um modelo por ativo (sem covariância dinâmica multivariada — DCC ficaria como evolução).
+
+---
+
+## 4. Liquidez (`liquidity.py`)
+
+**ADV.** Mediana (padrão) do volume financeiro dos últimos `window` pregões (21 ≈ 1 mês útil). Mediana > média aqui: leilões e rebalanceamentos de índice inflam a média e maquiariam o DTL.
+
+**DTL.** `DTL_i = ceil( posição_i / (participação * ADV_i) )`, participação padrão 20% do ADV. *Hipóteses:* volume futuro ≈ ADV recente; vender até o teto de participação não move preço. *Limitações:* em crise, volume seca e spreads abrem exatamente quando todos querem sair — o DTL calculado em tempos calmos é um piso otimista; ADV = 0 → DTL = ∞ (posição sinalizada como ilíquida).
+
+**Slippage bid-ask.** `custo = posição * (spread_bps / 10^4) / 2` — paga-se meio spread por atravessar do mid para o bid/ask. *Limitações:* piso de custo; não modela impacto de mercado (que cresce com participação — modelos de raiz quadrada ficam como evolução) nem spread dinâmico.
+
+---
+
+## 5. Fatores de risco (`factors.py`)
+
+**Correlação.** Pearson sobre a amostra completa ou os últimos `window` pregões (63 ≈ 1 trimestre). Correlações são instáveis entre regimes — e tipicamente **sobem em crises**, quando a diversificação mais faria falta.
+
+**PCA.** Autodecomposição da matriz de correlação (retornos padronizados por padrão — sem padronizar, o ativo mais volátil dominaria por escala). Saídas: variância explicada por componente, cargas (autovetores) e séries dos fatores (projeções). Interpretação típica em ações: PC1 ≈ fator mercado (cargas de mesmo sinal). *Limitações:* estrutura linear e estática; componentes além do 1º nem sempre têm interpretação econômica estável; sensível à janela.
+
+---
+
+## 6. Backtesting de VaR (`backtest.py`)
+
+**Violação.** `I_t = 1{ r_t < -VaR }`. Sob calibração perfeita, `P(I_t = 1) = p = 1 - alpha`.
+
+**Kupiec (1995) — POF/LR_uc.** Com `x` violações em `n` dias e `p_hat = x/n`:
+
+```
+LR_uc = -2 ln[ (1-p)^(n-x) p^x / ((1-p_hat)^(n-x) p_hat^x) ]  ~  Qui²(1)
+```
+
+Testa apenas a **frequência** de violações.
+
+**Christoffersen (1998) — LR_cc.** Adiciona independência via cadeia de Markov de 1ª ordem sobre `I_t` (transições n00, n01, n10, n11): sob H0, `P(violação | ontem violou) = P(violação | ontem calmo)`. `LR_cc = LR_uc + LR_ind ~ Qui²(2)`. Detecta **clusters** de violações que o Kupiec não vê.
+
+**Casos de borda.** `x = 0` ou categorias de transição vazias degenerariam `ln(0)`; o código aplica piso numérico (1e-12) dentro dos logaritmos — estatística finita e conservadora.
+
+**Limitações desta versão.** O VaR testado é **estático** (um número para todo o período, estimado na própria amostra — teste in-sample, otimista por construção). Backtest honesto exige VaR recalculado em janela móvel *out-of-sample*; está listado como evolução no README. Poder dos testes é baixo em amostras curtas (< 250 dias, poucas violações esperadas em 99%).
+
+---
+
+## 7. Limites monitorados (`configs/limits.yaml`)
+
+| Limite | Padrão | Interpretação |
+|---|---|---|
+| `var_99_max` | 5% | VaR 99% diário máximo do portfólio (fração do PL) |
+| `cvar_99_max` | 7% | ES 99% máximo (≥ VaR por construção) |
+| `dtl_max_days` | 5 dias | Pior DTL tolerado sob participação-alvo |
+| `garch_persistence_max` | 0,999 | Alerta de quase-IGARCH (variância de longo prazo indefinida) |
+| `min_history_days` | 252 | Histórico mínimo para estimação digna |
+
+Violações **não interrompem** o pipeline: geram `WARNING` no log e `breach=True` no `risk_summary.csv` — a decisão de reduzir risco é humana.
+
+---
+
+## Referências
+
+* Artzner, Delbaen, Eber & Heath (1999). *Coherent Measures of Risk*. Mathematical Finance.
+* Bollerslev (1986). *Generalized Autoregressive Conditional Heteroskedasticity*. Journal of Econometrics.
+* Christoffersen (1998). *Evaluating Interval Forecasts*. International Economic Review.
+* Kupiec (1995). *Techniques for Verifying the Accuracy of Risk Measurement Models*. Journal of Derivatives.
+* Jorion (2007). *Value at Risk*, 3ª ed. McGraw-Hill.

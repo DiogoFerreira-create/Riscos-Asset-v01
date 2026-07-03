@@ -1,0 +1,17 @@
+# Núcleo científico
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+arch>=6.0
+# Dados e persistência
+yfinance>=0.2
+pyarrow>=14.0
+plotly>=5.18
+PyYAML>=6.0
+# Datas/agenda (usado pela DAG)
+pendulum>=3.0
+# Desenvolvimento e testes
+pytest>=7.4
+# Orquestração (opcional: instale só no ambiente do scheduler)
+# apache-airflow>=2.8

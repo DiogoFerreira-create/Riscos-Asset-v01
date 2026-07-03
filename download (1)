@@ -1,0 +1,231 @@
+# Riscos-Asset-v01
+
+Plataforma em Python para **modelagem e monitoramento de risco de mercado e liquidez** de portfólios de ativos, com pipeline diário orquestrável pelo Apache Airflow, configuração 100% em YAML, testes automatizados e trilha de auditoria em Parquet.
+
+> Reconstrução de referência (v1.0.0) a partir da especificação funcional do projeto original, com arquitetura em camadas, validação de entradas, logging estruturado e documentação didática completa em `docs/`.
+
+---
+
+## Índice
+
+1. [Introdução](#introdução)
+2. [Objetivo](#objetivo)
+3. [Estrutura do projeto](#estrutura-do-projeto)
+4. [Instalação](#instalação)
+5. [Como executar](#como-executar)
+6. [Dependências](#dependências)
+7. [Exemplos de uso](#exemplos-de-uso)
+8. [Fluxograma da execução](#fluxograma-da-execução)
+9. [Descrição dos módulos](#descrição-dos-módulos)
+10. [Arquitetura](#arquitetura)
+11. [Testes](#testes)
+12. [Autores](#autores)
+13. [Licença](#licença)
+
+---
+
+## Introdução
+
+Áreas de risco precisam responder diariamente a três perguntas: **quanto o portfólio pode perder** (VaR/CVaR), **quão nervoso está o mercado** (volatilidade condicional) e **em quantos dias conseguimos sair das posições** (liquidez). Este projeto automatiza essas respostas de ponta a ponta: extrai dados, calcula as métricas, valida os próprios modelos por backtesting estatístico e consolida um resumo executivo com verificação de limites — tudo com artefatos intermediários auditáveis em disco.
+
+## Objetivo
+
+* Calcular **VaR** (histórico e paramétrico Delta-Normal) e **CVaR/Expected Shortfall** por ativo e do portfólio.
+* Estimar **volatilidade condicional** via **GARCH(1,1)** com previsão 1 passo à frente.
+* Medir **liquidez**: ADV (volume médio diário), **DTL** (dias para liquidar) e custo de **slippage bid-ask**.
+* Extrair **fatores de risco**: matriz de correlação (móvel ou amostra completa) e **PCA**.
+* **Backtestar o VaR** com os testes de **Kupiec (POF)** e **Christoffersen (cobertura condicional)**.
+* Gerar um **dashboard HTML interativo e autocontido** (Plotly): zoom, pan, tooltips e legendas clicáveis em todos os gráficos, abrindo offline em qualquer navegador.
+* Rodar tudo em um **pipeline diário** (Airflow em produção; modo local para desenvolvimento/CI).
+
+## Estrutura do projeto
+
+```
+Riscos-Asset-v01/
+├── configs/                  # Configuração em YAML (nada de números mágicos no código)
+│   ├── paths.yaml            #   diretórios (sobrescrevíveis por variáveis de ambiente)
+│   ├── limits.yaml           #   limites de risco monitorados
+│   └── pipeline.yaml         #   universo, pesos, janelas, fonte de dados
+├── dags/
+│   └── risk_pipeline.py      # DAG do Airflow + executor local (mesmas tarefas)
+├── src/
+│   └── risk_models/          # Pacote com os modelos (API pública no __init__.py)
+│       ├── config.py         #   dataclasses + carga/validação dos YAML
+│       ├── exceptions.py     #   hierarquia de erros do domínio
+│       ├── logging_setup.py  #   logging console + arquivo rotativo
+│       ├── validation.py     #   validadores compartilhados
+│       ├── data_io.py        #   persistência Parquet
+│       ├── returns.py        #   preços (yfinance/sintético), log-retornos, winsorização
+│       ├── var.py            #   VaR histórico/paramétrico, CVaR, portfólio
+│       ├── garch.py          #   GARCH(1,1) e previsão de volatilidade
+│       ├── liquidity.py      #   ADV, DTL, slippage
+│       ├── factors.py        #   correlação e PCA
+│       └── backtest.py       #   Kupiec e Christoffersen
+├── tests/                    # 53 testes pytest (unitários + propriedades estatísticas)
+├── data/                     # Artefatos Parquet do pipeline (gerado em runtime)
+├── outputs/                  # Tabelas finais + report/risk_dashboard.html
+├── logs/                     # Logs rotativos de execução
+├── docs/                     # Documentação técnica completa (PDF) + diagramas
+├── requirements.txt
+├── pyproject.toml
+├── MODEL_RISK.md             # Hipóteses, fórmulas e limitações dos modelos
+└── README.md
+```
+
+## Instalação
+
+Pré-requisitos: **Python 3.10+** e `pip`.
+
+```bash
+# 1) (Opcional, recomendado) ambiente virtual
+python -m venv .venv && source .venv/bin/activate      # Linux/macOS
+# .venv\Scripts\activate                               # Windows
+
+# 2) Dependências
+pip install -r requirements.txt
+
+# 3) (Opcional) instalar o pacote em modo editável
+pip install -e .
+```
+
+> O Airflow **não** é dependência obrigatória: instale-o apenas no ambiente do scheduler (linha comentada no `requirements.txt`). Sem ele, o pipeline roda em modo local.
+
+## Como executar
+
+**Modo local (desenvolvimento/CI):**
+
+```bash
+python dags/risk_pipeline.py
+```
+
+Saídas: Parquets em `data/curated_risk_pipeline/`, resumo em `outputs/tables/risk_summary.csv`, **dashboard interativo em `outputs/report/risk_dashboard.html`** (dê duplo clique para abrir no navegador — não precisa de servidor nem internet) e log em `logs/risk_pipeline.log`.
+
+**Com Apache Airflow:**
+
+1. Instale o Airflow (`pip install apache-airflow`) no ambiente do scheduler;
+2. Copie (ou aponte um symlink de) `dags/risk_pipeline.py` para a `dags_folder`;
+3. A DAG `risk_pipeline` aparecerá na UI com agenda `08:00 America/Recife`, segunda a sexta (`0 8 * * 1-5`), `catchup=False` e 2 retries por tarefa.
+
+**Configuração por variáveis de ambiente** (têm precedência sobre os YAML):
+
+```bash
+export RISK_RAW_DIR=/dados/risk/raw
+export RISK_CURATED_DIR=/dados/risk/curated
+export RISK_TABLES_DIR=/dados/risk/tables
+export RISK_REPORTS_DIR=/dados/risk/report
+export RISK_LOGS_DIR=/var/log/risk
+```
+
+**Fonte de dados** (`configs/pipeline.yaml -> data_source`):
+
+| Valor | Comportamento |
+|---|---|
+| `yfinance` | Somente dados reais; falha de rede interrompe com `DataSourceError`. |
+| `synthetic` | Somente dados simulados (GBM, semente fixa) — offline e reprodutível. |
+| `auto` *(padrão)* | Tenta `yfinance`; sem rede, cai para sintético com `WARNING` no log. |
+
+## Dependências
+
+| Pacote | Papel no projeto |
+|---|---|
+| pandas / numpy | Estruturas de dados e álgebra vetorizada de toda a plataforma |
+| scipy | Distribuições (Normal, Qui-quadrado) para VaR paramétrico e testes de backtest |
+| arch | Estimação GARCH por máxima verossimilhança |
+| scikit-learn | PCA (fatores de risco) |
+| yfinance | Download de preços/volumes reais |
+| pyarrow | Motor Parquet (persistência tipada dos artefatos) |
+| plotly | Dashboard interativo (HTML autocontido com plotly.js embutido) |
+| PyYAML | Leitura dos arquivos de configuração |
+| pendulum | Datas com fuso horário na agenda da DAG |
+| pytest | Suíte de testes |
+
+## Exemplos de uso
+
+Uso do pacote como biblioteca, fora do pipeline:
+
+```python
+from risk_models import (
+    DataSource, download_market_data, log_returns,
+    historical_var, conditional_var, fit_garch,
+)
+
+md = download_market_data(("PETR4.SA", "VALE3.SA"), start="2022-01-02",
+                          source=DataSource.AUTO)
+rets = log_returns(md.prices)
+
+var99 = historical_var(rets["PETR4.SA"], alpha=0.99)   # ex.: 0.041 => 4,1%
+es99 = conditional_var(rets["PETR4.SA"], alpha=0.99)   # sempre >= var99
+
+g = fit_garch(rets["PETR4.SA"])
+print(f"VaR 99%: {var99:.2%} | CVaR: {es99:.2%} | "
+      f"vol prevista (anual): {g.forecast_vol_annual:.1%} | "
+      f"persistência: {g.persistence:.3f}")
+```
+
+## Fluxograma da execução
+
+```mermaid
+flowchart TD
+    A[1. task_extract_prices<br/>yfinance ou sintético GBM] -->|prices.parquet| B[2. task_compute_returns<br/>log-retornos + winsorização]
+    B -->|returns.parquet| C[3. task_var_metrics<br/>VaR hist/param + CVaR]
+    B -.->|returns_winsor.parquet| D[4. task_garch_vol<br/>GARCH 1,1 por ativo]
+    A -.->|volumes.parquet| E[5. task_liquidity_metrics<br/>ADV, DTL, slippage]
+    B -.->|returns_winsor.parquet| F[6. task_factor_analysis<br/>correlação móvel + PCA]
+    B -.->|returns.parquet| G[7. task_var_backtest<br/>Kupiec + Christoffersen]
+    C --> D --> E --> F --> G
+    C -.-> H[8. task_consolidate<br/>limites → risk_summary.csv]
+    E -.-> H
+    G --> H
+    H --> I[9. task_generate_dashboard<br/>Plotly → risk_dashboard.html]
+```
+
+*(Setas cheias = ordem de execução; tracejadas = dependência de dados via Parquet. Versão renderizada em `docs/fluxo_execucao.png`.)*
+
+## Descrição dos módulos
+
+| Módulo | Responsabilidade | Funções/classes principais |
+|---|---|---|
+| `config.py` | Configuração tipada, precedência env > YAML > padrão, validação | `load_config`, `RiskConfig`, `DataSource`, `VarMethod` |
+| `exceptions.py` | Erros do domínio capturáveis em bloco único | `RiskModelError` e subclasses |
+| `logging_setup.py` | Logging único (console + arquivo rotativo), idempotente | `setup_logging`, `get_logger` |
+| `validation.py` | Pré-condições compartilhadas com mensagens uniformes | `as_clean_series`, `require_alpha`, ... |
+| `data_io.py` | Contrato de troca entre tarefas (Parquet), criação de pastas | `save_parquet`, `load_parquet` |
+| `returns.py` | Aquisição de dados (real/sintética), log-retornos, winsorização | `download_market_data`, `log_returns`, `winsorize_returns` |
+| `var.py` | VaR histórico/paramétrico, CVaR, retorno e relatório de portfólio | `historical_var`, `parametric_var`, `conditional_var`, `var_report` |
+| `garch.py` | GARCH(1,1), persistência, previsão de vol 1 passo | `fit_garch`, `garch_report`, `GarchResult` |
+| `liquidity.py` | ADV (mediana robusta), DTL com teto de participação, slippage | `average_daily_volume`, `days_to_liquidate`, `bid_ask_slippage` |
+| `factors.py` | Correlação (móvel/cheia) e PCA padronizado | `correlation_matrix`, `pca_factors`, `PcaResult` |
+| `backtest.py` | Violações, Kupiec (LR_uc) e Christoffersen (LR_cc) | `compute_violations`, `kupiec_pof_test`, `christoffersen_test` |
+| `reporting.py` | Figuras Plotly + montagem do dashboard autocontido com isolamento por seção | `figure_*`, `build_dashboard_html` |
+
+## Arquitetura
+
+Três camadas com dependência em sentido único:
+
+1. **Infraestrutura** (`config`, `exceptions`, `logging_setup`, `validation`, `data_io`) — não conhece finanças;
+2. **Modelos** (`returns`, `var`, `garch`, `liquidity`, `factors`, `backtest`) — funções puras: DataFrame entra, resultado sai; sem estado global, sem I/O de rede escondido;
+3. **Orquestração** (`dags/risk_pipeline.py`) — a única camada que conhece o Airflow e a ordem das tarefas; troca dados **via Parquet em disco** (não XCom), tornando cada tarefa idempotente, re-executável isoladamente e auditável.
+
+Diagrama completo em `docs/arquitetura.png`. Justificativas de cada decisão: capítulo 5 da documentação em `docs/`.
+
+## Testes
+
+```bash
+pytest            # 53 testes, ~4 s
+pytest -v         # detalhado
+```
+
+A suíte valida fórmulas contra **valores fechados da teoria** (ex.: VaR paramétrico vs. `z * sigma` da Normal; ES analítico), **propriedades estruturais** (CVaR ≥ VaR; monotonicidade da variância explicada do PCA), **casos de borda** (ADV zero → DTL infinito; zero violações no Kupiec) e **recuperação de parâmetros** (GARCH ajustado sobre série simulada com parâmetros conhecidos) e o **dashboard** (HTML autocontido com plotly.js embutido, contagem de violações marcadas, isolamento de seções com falha).
+
+## Dashboard interativo
+
+A última tarefa do pipeline gera `outputs/report/risk_dashboard.html` com 8 seções: checagem de limites (tabela com violações em vermelho), preços normalizados (base 100), retornos do portfólio com linhas de −VaR 95/99% e marcadores nas violações, VaR/CVaR por ativo, GARCH (vol prevista + persistência em eixo duplo), heatmap de correlação, PCA (variância explicada + cargas) e DTL com linha de limite. Tudo interativo — zoom de região, hover com valores, clique na legenda para isolar séries — e **autocontido**: o `plotly.js` vai embutido no arquivo (~5 MB), então ele abre offline e pode ser anexado a um e-mail. Uma seção com dado ausente vira um aviso amarelo no próprio HTML sem impedir as demais.
+
+## Autores
+
+* **Diogo Ferreira** — concepção, especificação funcional e modelagem quantitativa.
+* Reconstrução de engenharia e documentação: colaboração assistida por IA (Claude/Anthropic), revisada pelo autor.
+
+## Licença
+
+Distribuído sob a licença **MIT** — uso, cópia e modificação livres, sem garantia. Veja `LICENSE` (adicione o arquivo se for publicar o repositório).

@@ -1,0 +1,101 @@
+"""Testes de risk_models.reporting: figuras e montagem do dashboard HTML."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import pytest
+
+from risk_models import (
+    build_dashboard_html,
+    figure_correlation,
+    figure_limits_table,
+    figure_liquidity,
+    figure_normalized_prices,
+    figure_portfolio_var,
+)
+from risk_models.exceptions import DataValidationError
+
+
+@pytest.fixture()
+def prices(rng: np.random.Generator) -> pd.DataFrame:
+    idx = pd.bdate_range("2023-01-02", periods=120)
+    base = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, size=(120, 2)), axis=0))
+    return pd.DataFrame(base, index=idx, columns=["AAA", "BBB"])
+
+
+class TestFigures:
+    def test_normalized_prices_start_at_100(self, prices: pd.DataFrame) -> None:
+        fig = figure_normalized_prices(prices)
+        assert isinstance(fig, go.Figure)
+        # Toda série normalizada começa exatamente em 100 (base da régua).
+        for trace in fig.data:
+            assert trace.y[0] == pytest.approx(100.0)
+
+    def test_portfolio_var_marks_expected_violations(self) -> None:
+        """Série construída: 6 dias abaixo de -2% devem virar 6 marcadores."""
+        r = pd.Series(np.full(300, 0.001))
+        r.iloc[:6] = -0.05
+        fig = figure_portfolio_var(r, {0.99: 0.02})
+        breach_trace = next(t for t in fig.data if "Violações" in (t.name or ""))
+        assert len(breach_trace.x) == 6
+
+    def test_correlation_requires_data(self) -> None:
+        with pytest.raises(DataValidationError):
+            figure_correlation(pd.DataFrame())
+
+    def test_liquidity_flags_illiquid_in_title(self) -> None:
+        rep = pd.DataFrame({
+            "position_value": [1e6, 1e6],
+            "adv": [1e6, 0.0],
+            "dtl_days": [5.0, np.inf],
+            "slippage_cost": [500.0, 500.0],
+        }, index=["LIQ", "ILQ"])
+        fig = figure_liquidity(rep, dtl_limit=5.0)
+        assert "ILQ" in fig.layout.title.text  # ilíquido aparece nomeado
+
+
+class TestDashboardAssembly:
+    def test_html_is_selfcontained_and_interactive(self, tmp_path: Path,
+                                                   prices: pd.DataFrame) -> None:
+        out = tmp_path / "dash.html"
+        build_dashboard_html(
+            [("preços", lambda: figure_normalized_prices(prices))],
+            out, source_label="synthetic",
+        )
+        html = out.read_text(encoding="utf-8")
+        assert "plotly" in html.lower()          # biblioteca embutida
+        assert "synthetic" in html               # fonte declarada no cabeçalho
+        assert out.stat().st_size > 500_000      # js inline => autocontido
+
+    def test_failed_section_becomes_warning_not_crash(self, tmp_path: Path,
+                                                      prices: pd.DataFrame) -> None:
+        """Isolamento: uma seção quebrada vira aviso; as demais renderizam."""
+        def broken() -> go.Figure:
+            raise DataValidationError("artefato ausente")
+        out = tmp_path / "dash.html"
+        build_dashboard_html(
+            [("quebrada", broken),
+             ("preços", lambda: figure_normalized_prices(prices))],
+            out,
+        )
+        html = out.read_text(encoding="utf-8")
+        assert "gráfico indisponível" in html
+        assert "artefato ausente" in html
+
+    def test_all_sections_failing_raises(self, tmp_path: Path) -> None:
+        def broken() -> go.Figure:
+            raise DataValidationError("x")
+        with pytest.raises(DataValidationError, match="Nenhuma seção"):
+            build_dashboard_html([("a", broken)], tmp_path / "d.html")
+
+    def test_limits_table_renders(self, tmp_path: Path) -> None:
+        summary = pd.DataFrame({
+            "metric": ["var_99"], "value": [0.02], "limit": [0.05],
+            "breach": [False],
+        })
+        fig = figure_limits_table(summary)
+        assert isinstance(fig.data[0], go.Table)

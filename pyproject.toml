@@ -1,0 +1,70 @@
+"""Testes de risk_models.backtest: propriedades estatísticas de Kupiec e
+Christoffersen sob H0 verdadeira e sob violações construídas."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from risk_models import (
+    christoffersen_test, compute_violations, historical_var, kupiec_pof_test,
+)
+from risk_models.exceptions import DataValidationError
+
+ALPHA = 0.99
+
+
+class TestViolations:
+    def test_count_matches_construction(self) -> None:
+        """8 perdas de -5% contra VaR de 2% => exatamente 8 violações."""
+        r = np.full(500, 0.001)
+        r[:8] = -0.05
+        v = compute_violations(pd.Series(r), var_estimate=0.02)
+        assert int(v.sum()) == 8
+
+    def test_var_must_be_positive(self) -> None:
+        with pytest.raises(DataValidationError):
+            compute_violations(pd.Series([0.0] * 100), var_estimate=-0.01)
+
+
+class TestKupiec:
+    def test_calibrated_model_not_rejected(self, rng: np.random.Generator) -> None:
+        """Violações i.i.d. na taxa exata 1% NÃO devem ser rejeitadas."""
+        v = (rng.uniform(size=5_000) < (1 - ALPHA)).astype(int)
+        res = kupiec_pof_test(pd.Series(v), ALPHA)
+        assert not res.reject_at_5pct
+
+    def test_bad_model_rejected(self, rng: np.random.Generator) -> None:
+        """Taxa real de 5% num VaR 99% (5x mais violações) DEVE rejeitar."""
+        v = (rng.uniform(size=5_000) < 0.05).astype(int)
+        res = kupiec_pof_test(pd.Series(v), ALPHA)
+        assert res.reject_at_5pct
+
+    def test_zero_violations_is_finite(self) -> None:
+        """Caso de borda x=0: estatística deve permanecer finita."""
+        res = kupiec_pof_test(pd.Series(np.zeros(1_000, dtype=int)), ALPHA)
+        assert np.isfinite(res.statistic)
+
+    def test_end_to_end_with_historical_var(self, normal_returns: pd.Series) -> None:
+        """Circuito completo: VaR histórico da própria amostra deve ser
+        aproximadamente bem calibrado nela (não rejeitar)."""
+        var99 = historical_var(normal_returns, ALPHA)
+        v = compute_violations(normal_returns, var99)
+        res = kupiec_pof_test(v, ALPHA)
+        assert not res.reject_at_5pct
+
+
+class TestChristoffersen:
+    def test_independent_violations_not_rejected(self, rng: np.random.Generator) -> None:
+        v = (rng.uniform(size=5_000) < (1 - ALPHA)).astype(int)
+        res = christoffersen_test(pd.Series(v), ALPHA)
+        assert not res.reject_at_5pct
+
+    def test_clustered_violations_rejected(self) -> None:
+        """50 violações em bloco contíguo: taxa global 1% (Kupiec ok),
+        mas dependência gritante => o teste combinado deve rejeitar."""
+        v = np.zeros(5_000, dtype=int)
+        v[1_000:1_050] = 1
+        res = christoffersen_test(pd.Series(v), ALPHA)
+        assert res.reject_at_5pct

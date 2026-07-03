@@ -1,0 +1,46 @@
+"""Testes de risk_models.garch: recuperação de parâmetros em dados simulados."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from risk_models import fit_garch
+from risk_models.exceptions import DataValidationError
+
+
+def simulate_garch(n: int, omega: float, alpha: float, beta: float,
+                   seed: int = 42) -> np.ndarray:
+    """Simula um GARCH(1,1) verdadeiro para testar a recuperação do ajuste."""
+    rng = np.random.default_rng(seed)
+    long_run = omega / (1 - alpha - beta)
+    variance = long_run
+    out = np.empty(n)
+    for t in range(n):
+        shock = rng.standard_normal() * np.sqrt(variance)
+        out[t] = shock
+        variance = omega + alpha * shock**2 + beta * variance
+    return out
+
+
+class TestFitGarch:
+    def test_recovers_persistence(self) -> None:
+        """Com 4.000 obs de um GARCH real (persistência 0.93), o ajuste deve
+        achar persistência na vizinhança e < 1."""
+        data = simulate_garch(4_000, omega=1e-6, alpha=0.08, beta=0.85)
+        result = fit_garch(data)
+        assert result.converged
+        assert 0.80 <= result.persistence < 1.0
+        assert result.persistence == pytest.approx(0.93, abs=0.07)
+
+    def test_forecast_is_positive_and_sane(self) -> None:
+        data = simulate_garch(2_000, omega=1e-6, alpha=0.08, beta=0.85)
+        result = fit_garch(data)
+        assert 0.0 < result.forecast_vol_daily < 0.10  # vol diária plausível
+        assert result.forecast_vol_annual == pytest.approx(
+            result.forecast_vol_daily * np.sqrt(252)
+        )
+
+    def test_short_series_rejected(self) -> None:
+        with pytest.raises(DataValidationError, match="mínimo"):
+            fit_garch(np.random.default_rng(0).normal(0, 0.01, size=100))

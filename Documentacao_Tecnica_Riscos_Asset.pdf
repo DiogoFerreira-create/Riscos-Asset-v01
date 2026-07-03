@@ -1,0 +1,47 @@
+"""Configuração compartilhada do pytest.
+
+Insere ``src/`` no ``sys.path`` para que os testes rodem sem exigir
+``pip install -e .`` — reduz atrito em ambientes novos e em CI.
+Também define fixtures de dados determinísticos reutilizadas por
+múltiplos arquivos de teste.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+@pytest.fixture()
+def rng() -> np.random.Generator:
+    """Gerador de números aleatórios com semente fixa (reprodutível)."""
+    return np.random.default_rng(seed=123)
+
+
+@pytest.fixture()
+def normal_returns(rng: np.random.Generator) -> pd.Series:
+    """10.000 retornos ~ N(0, 1%): grande o bastante para comparar
+    estimativas empíricas com valores teóricos com tolerância apertada."""
+    return pd.Series(rng.normal(loc=0.0, scale=0.01, size=10_000))
+
+
+@pytest.fixture()
+def returns_frame(rng: np.random.Generator) -> pd.DataFrame:
+    """DataFrame 500 x 3 de retornos correlacionados via fator comum."""
+    n = 500
+    market = rng.normal(0, 0.01, n)
+    data = {
+        "AAA": market + rng.normal(0, 0.005, n),
+        "BBB": market + rng.normal(0, 0.005, n),
+        "CCC": rng.normal(0, 0.012, n),
+    }
+    idx = pd.bdate_range("2022-01-03", periods=n)
+    return pd.DataFrame(data, index=idx)
